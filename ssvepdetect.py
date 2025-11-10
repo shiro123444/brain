@@ -52,7 +52,7 @@ class ssvepDetect:
             p.append(coe)
 
         # 找到相关系数最大值的索引，它就是最有可能的目标
-        return p.index(max(p))
+        return np.argmax(p)
 
     def pre_filter(self,data):
         # 将data为chs×N形式，即每一行是一个通道的数据
@@ -61,5 +61,6 @@ class ssvepDetect:
         fs = self.srate / 2
         N, Wn = scipysignal.ellipord([6 / fs, 90 / fs], [2 / fs, 100 / fs], 3, 40)
         b1, a1 = cast(Tuple[np.ndarray, np.ndarray], scipysignal.ellip(N, 1, 90, Wn, 'bandpass')) # 带通滤波
-        filter_data = scipysignal.filtfilt(b1, a1, scipysignal.filtfilt(b, a, data))
+        # 修复：显式指定axis=1，确保沿样本轴过滤
+        filter_data = scipysignal.filtfilt(b1, a1, scipysignal.filtfilt(b, a, data, axis=1), axis=1)
         return filter_data
