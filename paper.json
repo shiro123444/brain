@@ -1,0 +1,76 @@
+{
+"task": {
+"name": "SSVEP_epoch_frequency_classification",
+"description": "对已切片好的SSVEP数据片段进行8分类识别，标签为stimID(0..7)，表示被试注视的刺激块/频率编号。",
+"goal": {
+"primary": "在保持低延迟的前提下，提升分类准确率与稳健性",
+"secondary": [
+"提升低时窗（如1–2 s）下的鲁棒性",
+"在各频率类别上获得均衡的召回率",
+"给出可复现的优化方案与实现代码骨架"
+]
+}
+},
+"data_interface": {
+"input": {
+"X": "shape=[n_epochs, n_channels, n_samples]，为已分段的EEG数据（浮点）",
+"y": "shape=[n_epochs]，整数标签stimID，范围0..7",
+"fs": "采样率（Hz），例如250",
+"channels": "通道名称数组，如['Pz','P3','P4','Oz','O1','O2','POz','PO7','PO8']",
+"window_sec": "每个epoch的时长（秒），如1.0~3.0",
+"freq_map": "可选：stimID到物理频率Hz的映射，例如{0:8.18,1:8.97,...}"
+},
+"assumptions": [
+"各epoch已与刺激时间对齐，包含稳定SSVEP响应段",
+"不存在或已处理严重伪迹；若存在，可用稳健方法（如中位数滤波/通道拒绝）",
+"可用numpy/scipy/sklearn等常用库；如可用MNE更佳"
+]
+},
+"baseline_method": {
+"name": "CCA or CCA-RV",
+"reference_signals": "为每个频率构造sin/cos谐波基函数(M=2~3)",
+"scoring": "对每个频率做CCA得到相关系数score_i，取argmax作为预测",
+"rv_normalization": "可选：(score_i - mean_non_target_i) / (score_i + mean_non_target_i)",
+"decision": "argmax over frequencies"
+},
+"constraints": {
+"latency_ms_per_epoch": "<= 10~20ms（Python下尽量优化）",
+"real_time_ready": true,
+"compute_budget": "CPU优先，允许轻量矩阵运算/滤波器组"
+},
+"evaluation": {
+"protocols": [
+"k-fold交叉验证（k=5或10）",
+"留一被试交叉（如有多被试数据）"
+],
+"metrics": [
+"overall_accuracy",
+"per_class_recall",
+"macro_f1",
+"confusion_matrix",
+"latency_ms"
+],
+"success_criteria": {
+"accuracy_gain": "相对baseline提升≥+2~5%",
+"balanced_recall": "最弱类别召回提升",
+"latency": "不高于baseline"
+}
+},
+"improvement_directions": [
+"Filter-Bank CCA(FB-CCA)：多带通子带(如[4-8],[8-12],[12-20],[20-35]Hz)分频做CCA并加权融合",
+"TRCA/CORRCA模板法：为每频率学习模板，预测时计算相关，最后与CCA做集成",
+"RV归一化增强：对每频率做Z-score或分位归一化，降低频率间系统性偏差",
+"谐波选择与加权：M=2~4并尝试对谐波加权（如递减权）",
+"协方差收缩：Ledoit-Wolf或Ridge方式稳健估计，提升短窗稳定性",
+"集成与Stacking：将CCA/FB-CCA/TRCA输出作为特征，训练轻量分类器（如LogReg）做二次判决",
+"正则与通道裁剪：L1/L2选择通道子集，减少过拟合",
+"校准分层：先做每频率归一化再全局决策，或先做每通道归一化"
+],
+"deliverables_from_llm": [
+"改进方案简述（为什么有效）",
+"可落地的算法步骤与伪代码/代码骨架（fit/predict接口）",
+"关键超参数与推荐取值范围",
+"交叉验证与消融实验计划",
+"性能对比表述（预期增益与风险点）"
+]
+}
