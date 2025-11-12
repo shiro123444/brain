@@ -903,6 +903,160 @@ class OptimizedSSVEPClassifier:
         scores = self.predict_scores(X_test)
         return np.argmax(scores, axis=1)
     
+    def predict_with_debug(self, X_test, verbose=True):
+        """
+        带详细调试输出的预测
+        
+        参数:
+        -----
+        X_test : ndarray, shape [n_epochs, n_channels, n_samples] 或 [n_channels, n_samples]
+        verbose : bool, 是否输出详细信息
+        
+        返回:
+        ------
+        y_pred : ndarray
+        scores_detail : list of dict, 包含每个样本的详细得分信息
+        """
+        # 预处理
+        if X_test.ndim == 2:
+            X_test_filtered = SignalPreprocessor.apply_preprocessing(
+                X_test[np.newaxis, :, :], fs=self.fs, notch_freq=50
+            )[0]
+            n_epochs = 1
+        else:
+            X_test_filtered = SignalPreprocessor.apply_preprocessing(X_test, fs=self.fs, notch_freq=50)
+            n_epochs = X_test_filtered.shape[0]
+        
+        n_classes = len(self.freq_map)
+        scores_cca = np.zeros((n_epochs, n_classes))
+        scores_detail = []
+        
+        for epoch_idx, X in enumerate(X_test_filtered):
+            detail = {'epoch': epoch_idx}
+            
+            # 1. 标准CCA得分
+            cca_scores = {}
+            for stim_id, ref_signal in self.ref_signals.items():
+                rho = FilterBankCCA.cca_correlation(X, ref_signal)
+                cca_scores[stim_id] = rho
+            
+            if verbose:
+                print(f"\n样本 {epoch_idx}:")
+                print(f"  【步骤1: 标准CCA得分】")
+                for stim_id in sorted(cca_scores.keys()):
+                    freq = self.freq_map[stim_id]
+                    print(f"    频率 {freq:5.1f}Hz (类{stim_id}): {cca_scores[stim_id]:.4f}")
+            
+            detail['cca_scores'] = cca_scores.copy()
+            
+            # 2. Filter-Bank CCA
+            if self.use_fb_cca:
+                X_subbands = self.fb_cca.apply_subbands(X)
+                fb_scores = np.zeros(n_classes)
+                fb_detail = {}
+                
+                for band_idx, X_band in enumerate(X_subbands):
+                    band_range = self.subbands[band_idx]
+                    band_weight = self.fb_cca.weights[band_idx]
+                    
+                    for stim_id, ref_signal in self.ref_signals.items():
+                        rho = FilterBankCCA.cca_correlation(X_band, ref_signal)
+                        fb_scores[stim_id] += band_weight * rho
+                    
+                    if verbose and band_idx == 0:
+                        print(f"  【步骤2: Filter-Bank CCA (4个子带)】")
+                    
+                    if verbose:
+                        print(f"    子带{band_idx} {band_range} Hz (权重{band_weight}x):")
+                        for stim_id in sorted(cca_scores.keys()):
+                            freq = self.freq_map[stim_id]
+                            rho = FilterBankCCA.cca_correlation(X_band, self.ref_signals[stim_id])
+                            print(f"      {freq:5.1f}Hz: {rho:.4f} × {band_weight} = {rho*band_weight:.4f}")
+                
+                detail['fb_scores'] = fb_scores.copy()
+                
+                # CCA融合
+                cca_scores_array = np.array([cca_scores[sid] for sid in sorted(cca_scores.keys())])
+                combined_scores = 0.5 * cca_scores_array + 0.5 * fb_scores
+                
+                if verbose:
+                    print(f"  【步骤3: CCA和FB-CCA融合 (0.5x CCA + 0.5x FB-CCA)】")
+                    for stim_id in sorted(cca_scores.keys()):
+                        freq = self.freq_map[stim_id]
+                        cca_val = cca_scores[stim_id]
+                        fb_val = fb_scores[stim_id]
+                        combined = combined_scores[stim_id]
+                        print(f"    {freq:5.1f}Hz: 0.5×{cca_val:.4f} + 0.5×{fb_val:.4f} = {combined:.4f}")
+            else:
+                combined_scores = np.array([cca_scores[sid] for sid in sorted(cca_scores.keys())])
+            
+            detail['fused_cca_fb'] = combined_scores.copy()
+            
+            # 3. TRCA融合
+            if self.use_trca:
+                trca_scores_dict = self.trca.score(X)
+                trca_scores = np.array([trca_scores_dict[sid] for sid in sorted(trca_scores_dict.keys())])
+                
+                if verbose:
+                    print(f"  【步骤4: TRCA得分】")
+                    for stim_id in sorted(trca_scores_dict.keys()):
+                        freq = self.freq_map[stim_id]
+                        print(f"    {freq:5.1f}Hz: {trca_scores[stim_id]:.4f}")
+                
+                detail['trca_scores'] = trca_scores.copy()
+                
+                # CCA和TRCA融合
+                combined_scores = 0.6 * combined_scores + 0.4 * trca_scores
+                
+                if verbose:
+                    print(f"  【步骤5: CCA和TRCA最终融合 (0.6x CCA + 0.4x TRCA)】")
+                    for stim_id in sorted(trca_scores_dict.keys()):
+                        freq = self.freq_map[stim_id]
+                        cca_val = detail['fused_cca_fb'][stim_id]
+                        trca_val = trca_scores[stim_id]
+                        final = combined_scores[stim_id]
+                        print(f"    {freq:5.1f}Hz: 0.6×{cca_val:.4f} + 0.4×{trca_val:.4f} = {final:.4f}")
+            
+            detail['pre_norm_scores'] = combined_scores.copy()
+            scores_cca[epoch_idx, :] = combined_scores
+            
+            # 4. 归一化
+            if self.use_normalization:
+                # 对单个样本进行归一化
+                scores_norm = self.normalizer.normalize(combined_scores[np.newaxis, :])[0]
+                scores_cca[epoch_idx, :] = scores_norm
+                
+                if verbose:
+                    print(f"  【步骤6: {self.normalization_method}标准化】")
+                    for stim_id in sorted(trca_scores_dict.keys() if self.use_trca else cca_scores.keys()):
+                        freq = self.freq_map[stim_id]
+                        before = detail['pre_norm_scores'][stim_id]
+                        after = scores_norm[stim_id]
+                        print(f"    {freq:5.1f}Hz: {before:.4f} → {after:.4f}")
+            
+            detail['final_scores'] = scores_cca[epoch_idx, :].copy()
+            
+            # 最终决策
+            pred_id = np.argmax(scores_cca[epoch_idx, :])
+            pred_freq = self.freq_map[pred_id]
+            detail['predicted_id'] = pred_id
+            detail['predicted_freq'] = pred_freq
+            
+            if verbose:
+                print(f"  【最终决策】")
+                print(f"    预测频率: {pred_freq:.1f}Hz (类{pred_id})")
+                print(f"    所有得分排序:")
+                score_ranking = sorted(enumerate(scores_cca[epoch_idx, :]), key=lambda x: x[1], reverse=True)
+                for rank, (sid, score) in enumerate(score_ranking, 1):
+                    freq = self.freq_map[sid]
+                    marker = " ← 预测" if sid == pred_id else ""
+                    print(f"      {rank}. {freq:5.1f}Hz (类{sid}): {score:.4f}{marker}")
+            
+            scores_detail.append(detail)
+        
+        y_pred = np.argmax(scores_cca, axis=1)
+        return y_pred, scores_detail
+    
     def predict_proba(self, X_test):
         """
         预测概率（softmax）
