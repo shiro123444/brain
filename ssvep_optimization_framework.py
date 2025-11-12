@@ -22,6 +22,109 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ===================================================================
+# 预处理模块
+# ===================================================================
+
+class SignalPreprocessor:
+    """
+    EEG信号预处理
+    - 50Hz工频陷波滤波
+    - 6-90Hz带通滤波
+    """
+    
+    @staticmethod
+    def apply_preprocessing(data, fs=250, notch_freq=50):
+        """
+        应用预处理滤波
+        
+        参数:
+        -----
+        data : ndarray
+            形状为 [n_epochs, n_channels, n_samples] 或 [n_channels, n_samples]
+        fs : int
+            采样率
+        notch_freq : float
+            陷波频率 (Hz)
+        
+        返回:
+        ------
+        filtered : ndarray, 同输入形状
+        """
+        # 处理不同维度的输入
+        if data.ndim == 2:
+            # [n_channels, n_samples]
+            return SignalPreprocessor._filter_2d(data, fs, notch_freq)
+        elif data.ndim == 3:
+            # [n_epochs, n_channels, n_samples]
+            n_epochs = data.shape[0]
+            n_channels = data.shape[1]
+            n_samples = data.shape[2]
+            filtered = np.zeros_like(data)
+            
+            for epoch in range(n_epochs):
+                filtered[epoch] = SignalPreprocessor._filter_2d(data[epoch], fs, notch_freq)
+            
+            return filtered
+        else:
+            raise ValueError(f"Expected 2D or 3D array, got {data.ndim}D")
+    
+    @staticmethod
+    def _filter_2d(data, fs=250, notch_freq=50):
+        """
+        对2D数据 [n_channels, n_samples] 应用滤波
+        """
+        # 确保足够的数据长度
+        min_len = 200  # 最小采样数
+        if data.shape[1] < min_len:
+            # 数据太短，只做最小处理
+            return data.copy()
+        
+        try:
+            # 1. 50Hz陷波滤波 (消除工频干扰)
+            Q = 35  # 品质因数
+            b_notch, a_notch = signal.iircomb(notch_freq, Q, ftype='notch', fs=fs)
+            
+            # 检查滤波器阶数是否太高
+            filter_len = max(len(a_notch), len(b_notch))
+            if data.shape[1] > filter_len * 2:
+                data_notch = signal.filtfilt(b_notch, a_notch, data, axis=1)
+            else:
+                data_notch = data.copy()
+            
+            # 2. 6-90Hz带通滤波 (限制在SSVEP频段)
+            lowcut, highcut = 6, 90
+            nyquist = fs / 2
+            
+            # 椭圆滤波器
+            N, Wn = signal.ellipord(
+                [lowcut/nyquist, highcut/nyquist],
+                [2/nyquist, 100/nyquist],
+                gpass=3,
+                gstop=40
+            )
+            
+            # 限制滤波器阶数
+            N = min(N, data.shape[1] // 4)
+            if N < 1:
+                return data_notch
+            
+            b_bp, a_bp = signal.ellip(N, 1, 90, [lowcut/nyquist, highcut/nyquist], 'bandpass')
+            
+            # 检查是否可以使用filtfilt
+            filter_len_bp = max(len(a_bp), len(b_bp))
+            if data_notch.shape[1] > filter_len_bp * 2:
+                data_filtered = signal.filtfilt(b_bp, a_bp, data_notch, axis=1)
+            else:
+                data_filtered = data_notch
+            
+            return data_filtered
+        
+        except Exception as e:
+            # 如果滤波失败，返回原始数据
+            print(f"Warning: Filtering failed ({e}), using raw data")
+            return data.copy()
+
+# ===================================================================
 # 第一部分: 参考信号构造
 # ===================================================================
 
@@ -698,12 +801,16 @@ class OptimizedSSVEPClassifier:
         y_train : ndarray, shape [n_epochs]
         
         流程:
-        1. 构造参考信号
-        2. 训练TRCA (if enabled)
-        3. 学习归一化参数 (if enabled)
-        4. （如需Stacking）训练meta-learner
+        1. 预处理 (50Hz notch + 6-90Hz bandpass)
+        2. 构造参考信号
+        3. 训练TRCA (if enabled)
+        4. 学习归一化参数 (if enabled)
+        5. （如需Stacking）训练meta-learner
         """
-        n_samples = X_train.shape[2]
+        # 预处理: 50Hz陷波 + 6-90Hz带通滤波
+        X_train_filtered = SignalPreprocessor.apply_preprocessing(X_train, fs=self.fs, notch_freq=50)
+        
+        n_samples = X_train_filtered.shape[2]
         
         # 构造参考信号
         self.ref_signals, _ = ReferenceSignalBuilder.build_reference_signals(
@@ -713,11 +820,11 @@ class OptimizedSSVEPClassifier:
         
         # 训练TRCA
         if self.use_trca:
-            self.trca.fit(X_train, y_train, self.fs)
+            self.trca.fit(X_train_filtered, y_train, self.fs)
         
         # 学习归一化参数
         if self.use_normalization:
-            scores_train = self.predict_scores(X_train)
+            scores_train = self.predict_scores(X_train_filtered)
             self.normalizer.fit(scores_train, y_train)
     
     def predict_scores(self, X_test):
@@ -734,14 +841,20 @@ class OptimizedSSVEPClassifier:
         scores : ndarray, shape [n_epochs, n_classes]
                每行是一个epoch的8个频率得分
         """
+        # 预处理: 50Hz陷波 + 6-90Hz带通滤波
         if X_test.ndim == 2:
-            X_test = X_test[np.newaxis, :, :]
+            X_test_filtered = SignalPreprocessor.apply_preprocessing(
+                X_test[np.newaxis, :, :], fs=self.fs, notch_freq=50
+            )[0]
+            n_epochs = 1
+        else:
+            X_test_filtered = SignalPreprocessor.apply_preprocessing(X_test, fs=self.fs, notch_freq=50)
+            n_epochs = X_test_filtered.shape[0]
         
-        n_epochs = X_test.shape[0]
         n_classes = len(self.freq_map)
         scores_cca = np.zeros((n_epochs, n_classes))
         
-        for epoch_idx, X in enumerate(X_test):
+        for epoch_idx, X in enumerate(X_test_filtered):
             # 标准CCA得分
             cca_scores = {}
             for stim_id, ref_signal in self.ref_signals.items():
